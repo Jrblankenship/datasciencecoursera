@@ -1,0 +1,128 @@
+---
+title: "Model of weight-lifting techniques"
+author: "jrblankenship"
+date: "4/3/2021"
+output: html_document
+---
+# Modeling proper exercise movements  
+## Summary  
+The goal of this study is to generate a model of exercise, a dumbbell biceps curl, using data collected from participants asked to preform exercises correctly and incorrectly, with parameters for types of incorrect movements. Movement was detected by monitors on the host, utilizing glove, armband, and belt sensors, as well as on the dumbell used for exercise. Participants were asked to lift the dumbbell in one of five ways: correctly (A), throwing elbows to the front (B), lifting (C) or lowering (D) the dumbbell only half way, or throwing hips to the front (E). Each participant lifted in each manner ten times and their progress was monitored by an experienced weightlifter. The original paper the data was pulled from can be found [here](http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf).  Two machine learning methods, random forest and boosting, were used to model the data and predict unmarked activities.  
+
+## Data processing and splitting the training set  
+
+```{r reading in the files}
+train <- read.csv(url("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"))
+test <- read.csv(url("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"))
+dim(train)
+```
+```{r splitting the training set for validation, message=FALSE}
+set.seed(123)
+library(caret)
+inTrain <- createDataPartition(y = train$classe, p = 0.7, list = FALSE)
+training <- train[inTrain,]
+traintest <- train[-inTrain,]
+```
+Data for the analysis was downloaded from the course website. Because the "test" set was not amenable to cross-validation, the training set was partitioned into a training set (70% of the data) and a testing set (30% of the data). The data from the testing subset was reserved for cross-validation.  
+
+## Cleaning the data  
+
+```{r checking for columns with NAs, results="hide"}
+head(training)
+summary(training)
+colnames(training)[colSums(is.na(training)) > 0] #columns that have any NAs.
+colnames(training)[colSums(is.na(training)) > (length(training$classe)/2)] #columns in which more than 50% are NAs
+```
+A quick scan of the training set revealed that a number of columns contained numerous NAs (67 columns). To determine whether that missing data should be imputed or if those columns should be removed from the analysis, the number of rows with more than 50% NAs was calculated. All 67 rows with NA's had more than 50% of the data missing, and thus imputing the missing data would likely skew the results. In addition to the NA columns, there were a number of columns missing data for rows that were read as character columns (grepped in the cleaning data chunk below). There were also several columns whose values were specific to the subject, the time the experiment was run, or to the way the data was recorded (the latter represented by the "X" column shown in Figure 1B). All of these columns were removed from the training and testing datasets.  
+```{r}
+training$classe <- as.factor(training$classe) # to correct the interpretation of this column
+par(mfrow = c(1,2))
+plot(training$classe, main = "Class Distribution", xlab = "Class", ylab = "count")
+plot(training$classe, training$X, main = "Class vs. X", xlab = "Class", ylab = "Column X")
+```
+  
+**Figure 1** An exploration of the testing data. The plot on the right shows the distribution of class calls in the testing set. This shows that more values observations were made of exercises performed correctly than any other type of exercise. The plot on the left is a comparison of the class calls with the X column in the data, which appears to be a row number column. The high correlation between the class call and the row number suggests that the data was entered by class and also suggests that retaining that column in modeling would lead to bias in the model towards the order in which data was entered in a randomized dataset.  
+
+```{r cleaning data, message=FALSE}
+library(dplyr)
+removethis <- c("X", "user_name", "raw_timestamp_part_1", "raw_timestamp_part_2", "cvtd_timestamp", "new_window")
+NAcols <- colnames(training)[colSums(is.na(training)) > (length(training$classe)/2)]
+training <- training %>%
+  select(-NAcols) %>% #removes columns with NAs
+  select(-removethis) #these columns might skew the data/should not be considered in the analysis
+training <- training %>%
+  select(-grep("skew", names(training), value = TRUE)) %>% #these remove columns with few values
+  select(-grep("kurtosis", names(training), value = TRUE)) %>%
+  select(-grep("min", names(training), value = TRUE)) %>%
+  select(-grep("max", names(training), value = TRUE)) %>%
+  select(-grep("amplitude", names(training), value = TRUE))
+traintest <- traintest %>%
+  select(-NAcols) %>% #removes columns with NAs
+  select(-removethis) #these columns might skew the data/should not be considered in the analysis
+traintest <- traintest %>%
+  select(-grep("skew", names(traintest), value = TRUE)) %>% #these remove columns with few values
+  select(-grep("kurtosis", names(traintest), value = TRUE)) %>%
+  select(-grep("min", names(traintest), value = TRUE)) %>%
+  select(-grep("max", names(traintest), value = TRUE)) %>%
+  select(-grep("amplitude", names(traintest), value = TRUE))
+```
+
+## Defining models  
+There are a number of approaches that could be taken to model the exercise data to predict how the exercise was performed, but I chose to investigate two approaches, random forests and boosting. Both approaches are powerful modeling approaches widely used for this type of modeling, although their speed and interpretability are limitations. For this particular modeling exercise, neither speed nor the interpretability of the algorithm used to define the model are required for the success of the approach. 
+
+```{r random forest modeling, message=FALSE}
+library(parallel)
+library(doParallel)
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster) #these last two help speed up processing
+set.seed(2433)
+fitControl <- trainControl(method = "cv", number = 3, allowParallel = TRUE)
+modrf <- train(classe ~ ., data = training, method = "rf", ntree = 10, prox = TRUE, trcontrol = fitControl) #random forest modeling
+stopCluster(cluster)  #this line and the next are needed to turn off parallel processing
+registerDoSEQ()
+confusionMatrix(modrf)
+```
+
+``` {r boosted model}
+modboost <- train(classe ~ ., method = "gbm", data = training, verbose = FALSE) #boost modeling
+confusionMatrix(modboost)
+```
+Both of these models exhibited a high degree of accuracy (above 95%) for the training set and were thus used in cross-validation below.  
+
+## Cross-validation  
+
+One of the concerns of modeling is overfitting to the training set, and thus 30% of the data was withheld from the original training set for cross-validation purposes. Both the random forest and boosting model were tested for performance in the testing set. 
+```{r cross validation and analysis}
+pred1 <- predict(modrf,traintest); pred2 <- predict(modboost,traintest) #predict using the testing set
+rfaccuracy <- sum(pred1 == traintest$classe)/length(pred1) # measure of accuracy for rf prediction
+baccuracy <- sum(pred2 == traintest$classe)/length(pred2) # measure of accuracy for boost prediction
+comptable <- data.frame(pred1, pred2, observed = traintest$classe) # making a table for figures
+comp1 <- ggplot(comptable, aes(observed, pred1)) + geom_count()
+comp2 <- ggplot(comptable, aes(observed, pred2)) + geom_count()
+library(gridExtra)
+grid.arrange(comp1, comp2, nrow = 2)
+```
+  
+**Figure 2** Prediction versus observed call for the random forest (top) and boosted (bottom) models compared to the testing set. The size of the point is in proportion to the number of data points that fall within that value.  
+
+In the cross-validation exercise, the random forest model exhibited `r rfaccuracy` accuracy and the boosted model exhibited `r baccuracy` accuracy. Figure 2 shows the comparison between the predicted class values for each model and the actual class values. Again, both models performed quite well, with an accuracy above 95%.  
+
+## Prediction  
+
+The models above were used to define class calls for an unclassified dataset (the original "test" set downloaded from the course website). Prior to using the models to predict the format of the exercise being performed, the same cleaning protocol was used on the test set from the original data.
+```{r cleaning the test set}
+test2 <- test %>%
+  select(-NAcols) %>% #removes columns with NAs
+  select(-removethis) #these columns might skew the data/should not be considered in the analysis
+test2 <- test2 %>%
+  select(-grep("skew", names(test2), value = TRUE)) %>% #these remove columns with few values
+  select(-grep("kurtosis", names(test2), value = TRUE)) %>%
+  select(-grep("min", names(test2), value = TRUE)) %>%
+  select(-grep("max", names(test2), value = TRUE)) %>%
+  select(-grep("amplitude", names(test2), value = TRUE))
+```
+This cleaned data was then subjected to the same modeling used above to produce calls for the type of exercise performed.
+```{r and now for the predictions on the test set}
+pred1test <- predict(modrf,test2); pred2test <- predict(modboost,test2)
+numsame <- sum(pred1test == pred2test)/length(pred1test) 
+```
+To determine if any discrepancies existed in the calls between the models, their output was compared. The calls showed a `r numsame`:1 similarity, and thus made the same predictions for each row of the test data. Those predictions were `r pred1test`. The overlap between the model predictions, coupled with their accuracy measured in both the training and testing sets, gives us high confidence in these predictions.
